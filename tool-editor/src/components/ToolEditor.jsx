@@ -11,225 +11,44 @@
  *  5. sharpness / clarity / noise no implementados → implementados con kernels reales
  */
 
-import { useState, useRef, useEffect, useCallback } from "react";
-// import EffectsPanel from "./effects/EffectsPanel.jsx";
+import { useRef, useCallback } from "react";
+import { S, FILTERS, TOOLS, ASPECT_PRESETS, SOCIAL_PRESETS, ADJ_DEFAULTS } from "../design/designSystem.js";
+import { useEditorState } from "../state/useEditorState.js";
+import { useEditorLifecycle, ToolEditorErrorBoundary } from "../lifecycle/useEditorLifecycle.js";
+import { validateConfig } from "../contract/toolContract.js";
+import {
+  applyPixelAdjustments,
+  bakeFilterToPixels,
+  estimateFileSize,
+  removeBackgroundAI as engineRemoveBgAI,
+  removeBackgroundFallback,
+} from "./effects/effectsEngine.js";
+import EffectsPanel from "./effects/EffectsPanel.jsx";
 
-// ─── Constantes ───────────────────────────────────────────────────────────────
+// ─── Constantes — importadas desde designSystem ───────────────────────────────
+// FILTERS, TOOLS, ASPECT_PRESETS, SOCIAL_PRESETS, ADJ_DEFAULTS → designSystem.js
 
-const FILTERS = [
-  { name: "Original", id: "none",   css: "none" },
-  { name: "Vivid",    id: "vivid",  css: "saturate(1.8) contrast(1.1)" },
-  { name: "Fade",     id: "fade",   css: "opacity(0.9) saturate(0.65) brightness(1.12)" },
-  { name: "Noir",     id: "noir",   css: "grayscale(1) contrast(1.35) brightness(0.95)" },
-  { name: "Warm",     id: "warm",   css: "sepia(0.35) saturate(1.2) brightness(1.05)" },
-  { name: "Cool",     id: "cool",   css: "hue-rotate(20deg) saturate(1.15) brightness(1.02)" },
-  { name: "Chrome",   id: "chrome", css: "contrast(1.2) saturate(1.4) brightness(0.92)" },
-  { name: "Matte",    id: "matte",  css: "contrast(0.88) saturate(0.75) brightness(1.08)" },
-  { name: "Retro",    id: "retro",  css: "sepia(0.5) saturate(1.3) contrast(1.05)" },
-  { name: "Lomo",     id: "lomo",   css: "saturate(1.6) contrast(1.25) brightness(0.88)" },
-  { name: "Analog",   id: "analog", css: "sepia(0.2) saturate(1.1) contrast(1.05) brightness(1.02)" },
-  { name: "Cinema",   id: "cinema", css: "contrast(1.25) saturate(0.85) brightness(0.93)" },
-];
 
-const ASPECT_PRESETS = [
-  { label:"1:1",  w:1,  h:1,  tag:"Cuadrado"  },
-  { label:"16:9", w:16, h:9,  tag:"Wide HD"   },
-  { label:"4:3",  w:4,  h:3,  tag:"Clásico"   },
-  { label:"3:2",  w:3,  h:2,  tag:"DSLR"      },
-  { label:"21:9", w:21, h:9,  tag:"Cine"       },
-  { label:"9:16", w:9,  h:16, tag:"Story"      },
-  { label:"4:5",  w:4,  h:5,  tag:"Instagram"  },
-  { label:"2:3",  w:2,  h:3,  tag:"Retrato"    },
-  { label:"3:1",  w:3,  h:1,  tag:"Panorama"   },
-];
-
-const SOCIAL_PRESETS = [
-  { label:"IG Post",  w:1080, h:1080 },
-  { label:"IG Story", w:1080, h:1920 },
-  { label:"FB Post",  w:1200, h:630  },
-  { label:"Twitter",  w:1500, h:500  },
-  { label:"YT Thumb", w:1280, h:720  },
-  { label:"LinkedIn", w:1200, h:627  },
-];
-
-const ADJ_DEFAULTS = {
-  exposure:0, contrast:0, brightness:0, shadows:0, highlights:0,
-  saturation:0, temperature:0, tint:0, vibrance:0,
-  sharpness:0, clarity:0, noise:0, vignette:0,
-};
-
-const TOOLS = [
-  { id:"select", icon:"⬚", label:"Selección",       cursor:"default"   },
-  { id:"crop",   icon:"✂",  label:"Cortar",          cursor:"crosshair" },
-  { id:"rmbg",   icon:"🪄", label:"Quitar fondo IA", cursor:"cell"      },
-  { id:"brush",  icon:"✏",  label:"Pincel borrar",   cursor:"cell"      },
-  { id:"hand",   icon:"✋", label:"Mano",            cursor:"grab"      },
-  { id:"zoom",   icon:"⊕",  label:"Zoom",            cursor:"zoom-in"   },
-  { id:"fx",     icon:"✦",  label:"Efectos",         cursor:"default"   },
-];
-
-// ─── Utilidades pixel ─────────────────────────────────────────────────────────
-
-/** FIX #4 + #5: Implementación completa de todos los ajustes */
-function applyPixelAdjustments(imageData, adj) {
-  const d   = imageData.data;
-  const W   = imageData.width;
-  const H   = imageData.height;
-
-  // Parámetros normalizados
-  const exp  = adj.exposure    / 100;
-  const con  = (adj.contrast   + 100) / 100;
-  const bri  = adj.brightness  / 100;
-  const sha  = adj.shadows     / 100;   // FIX #4
-  const hig  = adj.highlights  / 100;   // FIX #4
-  const sat  = (adj.saturation + 100) / 100;
-  const tmp  = adj.temperature / 100;
-  const tnt  = adj.tint        / 100;
-  const vig  = adj.vignette    / 100;
-  const noi  = adj.noise       / 100;   // FIX #5
-  const cxv  = W / 2, cyv = H / 2;
-  const maxD = Math.sqrt(cxv*cxv + cyv*cyv);
-
-  // FIX #5: Sharpness — guardar copia para convolución
-  let src = null;
-  if (adj.sharpness > 0 || adj.clarity !== 0) {
-    src = new Uint8ClampedArray(d);
-  }
-
-  for (let i = 0; i < d.length; i += 4) {
-    let r = d[i], g = d[i+1], b = d[i+2];
-
-    // Exposure
-    r = Math.min(255, r * (1 + exp));
-    g = Math.min(255, g * (1 + exp));
-    b = Math.min(255, b * (1 + exp));
-
-    // Contrast
-    r = Math.min(255, Math.max(0, ((r/255 - 0.5)*con + 0.5)*255));
-    g = Math.min(255, Math.max(0, ((g/255 - 0.5)*con + 0.5)*255));
-    b = Math.min(255, Math.max(0, ((b/255 - 0.5)*con + 0.5)*255));
-
-    // Brightness
-    r = Math.min(255, Math.max(0, r + bri*255));
-    g = Math.min(255, Math.max(0, g + bri*255));
-    b = Math.min(255, Math.max(0, b + bri*255));
-
-    // FIX #4 — Shadows: boost zonas oscuras, no afecta altas luces
-    // FIX #4 — Highlights: ajusta zonas claras, no afecta sombras
-    const lum = (r*0.299 + g*0.587 + b*0.114) / 255;
-    const shadowMask    = Math.max(0, 1 - lum*2);         // fuerte en oscuros
-    const highlightMask = Math.max(0, lum*2 - 1);         // fuerte en claros
-    const shadowBoost    = sha * shadowMask * 80;
-    const highlightBoost = hig * highlightMask * 80;
-    r = Math.min(255, Math.max(0, r + shadowBoost + highlightBoost));
-    g = Math.min(255, Math.max(0, g + shadowBoost + highlightBoost));
-    b = Math.min(255, Math.max(0, b + shadowBoost + highlightBoost));
-
-    // Temperature / Tint
-    r = Math.min(255, Math.max(0, r + tmp*35));
-    b = Math.min(255, Math.max(0, b - tmp*35));
-    g = Math.min(255, Math.max(0, g + tnt*20));
-
-    // Saturation
-    const gray = r*0.299 + g*0.587 + b*0.114;
-    r = Math.min(255, Math.max(0, gray + (r-gray)*sat));
-    g = Math.min(255, Math.max(0, gray + (g-gray)*sat));
-    b = Math.min(255, Math.max(0, gray + (b-gray)*sat));
-
-    // FIX #5 — Noise (grano aleatorio pero determinista por posición)
-    if (noi > 0) {
-      const px = (i/4) % W, py = Math.floor(i/4/W);
-      // Pseudo-random basado en posición (sin Math.random para ser consistente)
-      const rand = ((px*1234 + py*5678) % 256) / 256 - 0.5;
-      const grain = rand * noi * 60;
-      r = Math.min(255, Math.max(0, r + grain));
-      g = Math.min(255, Math.max(0, g + grain));
-      b = Math.min(255, Math.max(0, b + grain));
-    }
-
-    // Vignette
-    if (vig !== 0) {
-      const px  = (i/4) % W, py = Math.floor(i/4/W);
-      const dist = Math.sqrt((px-cxv)**2 + (py-cyv)**2) / maxD;
-      const v   = vig > 0 ? 1 - dist*vig : 1 + dist*(-vig)*0.5;
-      r = Math.min(255, Math.max(0, r*v));
-      g = Math.min(255, Math.max(0, g*v));
-      b = Math.min(255, Math.max(0, b*v));
-    }
-
-    d[i] = r; d[i+1] = g; d[i+2] = b;
-  }
-
-  // FIX #5 — Sharpness: kernel unsharp mask 3x3
-  if (src && adj.sharpness > 0) {
-    const str = adj.sharpness / 100;
-    for (let y = 1; y < H-1; y++) {
-      for (let x = 1; x < W-1; x++) {
-        const c = (y*W + x)*4;
-        for (let ch = 0; ch < 3; ch++) {
-          // Laplacian blur neighbours
-          const blur = (
-            src[(y-1)*W*4 + x*4 + ch] +
-            src[(y+1)*W*4 + x*4 + ch] +
-            src[y*W*4 + (x-1)*4 + ch] +
-            src[y*W*4 + (x+1)*4 + ch]
-          ) / 4;
-          const sharpened = d[c+ch] + (d[c+ch] - blur) * str * 2;
-          d[c+ch] = Math.min(255, Math.max(0, sharpened));
-        }
-      }
-    }
-  }
-
-  // FIX #5 — Clarity: micro-contraste en medios tonos (versión ligera)
-  if (src && adj.clarity !== 0) {
-    const str = adj.clarity / 100;
-    for (let y = 2; y < H-2; y++) {
-      for (let x = 2; x < W-2; x++) {
-        const c = (y*W + x)*4;
-        for (let ch = 0; ch < 3; ch++) {
-          const local = (
-            src[(y-2)*W*4 + x*4 + ch] + src[(y+2)*W*4 + x*4 + ch] +
-            src[y*W*4 + (x-2)*4 + ch] + src[y*W*4 + (x+2)*4 + ch]
-          ) / 4;
-          d[c+ch] = Math.min(255, Math.max(0, d[c+ch] + (d[c+ch] - local)*str*1.5));
-        }
-      }
-    }
-  }
-
-  return imageData;
-}
-
-/** FIX #3: Hornear filtro CSS en píxeles para exportación correcta */
-function bakeFilterToPixels(canvas, filterCSS) {
-  if (!filterCSS || filterCSS === "none") return;
-  const tmp = document.createElement("canvas");
-  tmp.width = canvas.width; tmp.height = canvas.height;
-  const tc = tmp.getContext("2d");
-  tc.filter = filterCSS;
-  tc.drawImage(canvas, 0, 0);
-  canvas.getContext("2d").clearRect(0, 0, canvas.width, canvas.height);
-  canvas.getContext("2d").drawImage(tmp, 0, 0);
-}
-
-function estimateSize(w, h, format, quality) {
-  const bpp  = format === "png" ? 4 : format === "webp" ? 1.5 : 1;
-  const base = w * h * bpp * (format === "jpeg" ? quality/100 : 1);
-  const kb   = Math.round(base / 1024);
-  return kb > 1024 ? `~${(kb/1024).toFixed(1)} MB` : `~${kb} KB`;
-}
 
 // ─── Sub-componentes ──────────────────────────────────────────────────────────
 
 function SliderRow({ label, id, min=-100, max=100, value, onChange }) {
+  // Color del dial según valor: negativo=azul, cero=gris, positivo=teal
+  const pct    = ((value - min) / (max - min)) * 100;
+  const color  = value < 0 ? "#4f8ef7" : value > 0 ? "#00d4aa" : "#ccc";
+  const track  = `linear-gradient(to right, ${color} ${pct}%, #e0ddd5 ${pct}%)`;
+
   return (
     <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:5 }}>
       <span style={{ fontSize:10, color:"#777", width:72, flexShrink:0 }}>{label}</span>
-      <input type="range" min={min} max={max} value={value}
-        onChange={e => onChange(id, parseInt(e.target.value))}
-        style={{ flex:1, accentColor:"#00d4aa", cursor:"pointer" }} />
-      <span style={{ fontSize:10, color:"#00d4aa", width:26, textAlign:"right", flexShrink:0 }}>{value}</span>
+      <div style={{ flex:1, position:"relative" }}>
+        <input type="range" min={min} max={max} value={value}
+          onChange={e => onChange(id, parseInt(e.target.value))}
+          style={{ width:"100%", accentColor:color, cursor:"pointer",
+                   background:track, borderRadius:4, height:3,
+                   WebkitAppearance:"none", appearance:"none" }} />
+      </div>
+      <span style={{ fontSize:10, color:color, width:26, textAlign:"right", flexShrink:0, fontWeight:500 }}>{value}</span>
     </div>
   );
 }
@@ -291,39 +110,53 @@ function TbBtn({ onClick, children, dim, accent, danger }) {
 
 // ─── Componente principal ─────────────────────────────────────────────────────
 
-export default function ToolEditor({ onExport }) {
+// ─── Componente interno (sin error boundary) ──────────────────────────────────
+
+function ToolEditorInner({ initialImage, config: userConfig, onExport, onReady, onChange, onError }) {
   const canvasRef    = useRef(null);
   const fileInputRef = useRef(null);
 
-  // FIX #1: histRef para evitar stale closure en saveSnap
-  const histRef      = useRef({ list:[], idx:-1 });
+  // Capa 4: Contrato — mergear config con defaults
+  const config = validateConfig(userConfig);
 
-  // FIX #2: cleanImgRef guarda la imagen base sin ajustes aplicados
-  const cleanImgRef  = useRef(null);
+  // Capa 3: Estado
+  const state = useEditorState();
+  const {
+    cleanImgRef, imgEl, setImgEl,
+    fileName, setFileName,
+    originalSrc, setOriginalSrc,
+    canvasDims, setCanvasDims,
+    adj, setAdj, setAdjValue, resetAdj, resetAdjGroup,
+    activeFilter, setActiveFilter,
+    activeTab, setActiveTab,
+    activeTool, setActiveTool,
+    zoomLevel, setZoomLevel,
+    cropStart, setCropStart,
+    cropEnd, setCropEnd,
+    isCropping, setIsCropping,
+    aspectLock, setAspectLock,
+    resetCrop,
+    histRef, historyLen, setHistoryLen, histPos, setHistPos,
+    bgStatus, setBgStatus,
+    bgMessage, setBgMessage,
+    tolerance, setTolerance,
+    bgPreview, setBgPreview,
+    outputFormat, setOutputFormat,
+    quality, setQuality,
+    outW, setOutW,
+    outH, setOutH,
+  } = state;
 
-  const [imgEl,        setImgEl]        = useState(null);
-  const [fileName,     setFileName]     = useState("sin imagen");
-  const [originalSrc,  setOriginalSrc]  = useState(null);
-  const [adj,          setAdj]          = useState({ ...ADJ_DEFAULTS });
-  const [activeFilter, setActiveFilter] = useState("none");
-  const [activeTab,    setActiveTab]    = useState("adjust");
-  const [activeTool,   setActiveTool]   = useState("select");
-  const [outputFormat, setOutputFormat] = useState("jpeg");
-  const [quality,      setQuality]      = useState(90);
-  const [zoomLevel,    setZoomLevel]    = useState(1);
-  const [canvasDims,   setCanvasDims]   = useState({ w:0, h:0 });
-  const [cropStart,    setCropStart]    = useState(null);
-  const [cropEnd,      setCropEnd]      = useState(null);
-  const [isCropping,   setIsCropping]   = useState(false);
-  const [aspectLock,   setAspectLock]   = useState(null);
-  const [historyLen,   setHistoryLen]   = useState(0); // solo para forzar re-render
-  const [histPos,      setHistPos]      = useState(-1);
-  const [bgStatus,     setBgStatus]     = useState("idle");
-  const [bgMessage,    setBgMessage]    = useState("");
-  const [tolerance,    setTolerance]    = useState(30);
-  const [bgPreview,    setBgPreview]    = useState(null);
-  const [outW,         setOutW]         = useState(1080);
-  const [outH,         setOutH]         = useState(1080);
+  // Capa 5: Ciclo de vida
+  const { render, fitToView, saveSnap, loadSnap, loadImage, commitToBase } = useEditorLifecycle({
+    canvasRef, cleanImgRef,
+    adj, activeFilter, canvasDims,
+    setImgEl, setFileName, setOriginalSrc, setCanvasDims, setOutW, setOutH,
+    setZoomLevel, resetAdj, setActiveFilter,
+    histRef, setHistoryLen, setHistPos,
+    config, onReady, onError, onChange,
+    imgEl, fileName, outputFormat, historyLen, histPos,
+  });
 
   // ─── FIX #2: render siempre desde cleanImgRef, no desde imgEl modificado ──
   const render = useCallback((adjOverride, filterOverride) => {
@@ -345,37 +178,7 @@ export default function ToolEditor({ onExport }) {
 
   useEffect(() => { render(); }, [render]);
 
-  const fitToView = useCallback((cw, ch) => {
-    const wrap = document.getElementById("ce-wrap");
-    if (!wrap) return;
-    const maxW = wrap.clientWidth - 40, maxH = wrap.clientHeight - 40;
-    setZoomLevel(Math.min(1, Math.min(maxW/cw, maxH/ch)));
-  }, []);
-
-  // ─── FIX #1: saveSnap con ref para evitar stale histIdx ──────────────────
-  const saveSnap = useCallback((canvas) => {
-    const snap = canvas.toDataURL();
-    const h    = histRef.current;
-    h.list     = [...h.list.slice(0, h.idx+1), snap];
-    h.idx      = h.list.length - 1;
-    setHistoryLen(h.list.length);
-    setHistPos(h.idx);
-  }, []);
-
-  const loadSnap = useCallback((src) => {
-    const image = new Image();
-    image.onload = () => {
-      const canvas = canvasRef.current;
-      canvas.style.filter = "none";
-      canvas.width = image.width; canvas.height = image.height;
-      canvas.getContext("2d").drawImage(image, 0, 0);
-      cleanImgRef.current = image;
-      setImgEl(image);
-      setCanvasDims({ w:image.width, h:image.height });
-      fitToView(image.width, image.height);
-    };
-    image.src = src;
-  }, [fitToView]);
+  // fitToView, saveSnap, loadSnap → vienen del lifecycle hook
 
   const undo = () => {
     const h = histRef.current;
@@ -443,112 +246,31 @@ export default function ToolEditor({ onExport }) {
     newBase.src = canvas.toDataURL();
   }, [activeFilter, saveSnap]);
 
-  // ─── IA Remove BG ────────────────────────────────────────────────────────
-  const removeBackgroundAI = async () => {
+  // ─── IA Remove BG — delega a effectsEngine ───────────────────────────────
+  const handleRemoveBG = async () => {
     const canvas = canvasRef.current;
     if (!canvas || !cleanImgRef.current) return;
-    setBgStatus("loading"); setBgMessage("Enviando a Claude Vision...");
+    setBgStatus("loading");
     try {
-      const base64 = canvas.toDataURL("image/jpeg", 0.8).split(",")[1];
-      setBgMessage("Analizando sujeto principal...");
-      const response = await fetch("https://api.anthropic.com/v1/messages", {
-        method:"POST",
-        headers:{ "Content-Type":"application/json" },
-        body: JSON.stringify({
-          model:"claude-sonnet-4-20250514",
-          max_tokens:1000,
-          messages:[{
-            role:"user",
-            content:[
-              { type:"image", source:{ type:"base64", media_type:"image/jpeg", data:base64 } },
-              { type:"text",  text:`Analiza esta imagen. Devuelve SOLO JSON sin markdown:
-{
-  "subject": "descripción breve del sujeto",
-  "bg_colors": [[R,G,B],[R,G,B],[R,G,B]],
-  "sample_points": [[x_pct,y_pct],...],
-  "tolerance": 25
-}
-bg_colors: colores del FONDO (no del sujeto), RGB 0-255.
-sample_points: coordenadas 0.0-1.0 de píxeles que son FONDO seguro.
-tolerance: 10-60 según nitidez de bordes.` }
-            ]
-          }]
-        })
-      });
-      const data = await response.json();
-      const text = data.content?.find(b => b.type==="text")?.text || "";
-      let analysis;
-      try { analysis = JSON.parse(text.replace(/```json|```/g,"").trim()); }
-      catch { throw new Error("Respuesta IA inválida"); }
-      setBgMessage(`Sujeto: ${analysis.subject} — removiendo fondo...`);
-      await smartFloodFill(canvas, analysis);
+      const { subject } = await engineRemoveBgAI(canvas, tolerance, setBgMessage);
       setBgStatus("done");
-      setBgMessage(`✓ ${analysis.subject}`);
+      setBgMessage(`✓ ${subject}`);
       setBgPreview(canvas.toDataURL());
       const ni = new Image();
       ni.onload = () => { cleanImgRef.current = ni; setImgEl(ni); };
       ni.src = canvas.toDataURL();
       saveSnap(canvas);
-    } catch (err) {
+    } catch {
       setBgStatus("error");
       setBgMessage("Error IA — usando modo rápido");
-      fallbackRemove(canvas);
+      removeBackgroundFallback(canvas, tolerance);
+      setBgPreview(canvas.toDataURL());
+      const ni = new Image();
+      ni.onload = () => { cleanImgRef.current = ni; setImgEl(ni); };
+      ni.src = canvas.toDataURL();
+      saveSnap(canvas);
+      setBgStatus("done"); setBgMessage("✓ Modo rápido aplicado");
     }
-  };
-
-  const smartFloodFill = (canvas, analysis) => new Promise(resolve => {
-    const ctx     = canvas.getContext("2d");
-    const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    const d       = imgData.data;
-    const tol     = (analysis.tolerance || tolerance) * 3;
-    const bgColors= analysis.bg_colors || [[255,255,255]];
-    const samples = (analysis.sample_points || [[0,0],[1,0],[0,1],[1,1]])
-      .map(([xp,yp]) => ({ x:Math.round(xp*canvas.width), y:Math.round(yp*canvas.height) }));
-    const sampledColors = samples.map(({x,y}) => {
-      const i=(y*canvas.width+x)*4; return [d[i],d[i+1],d[i+2]];
-    });
-    const allBg   = [...bgColors, ...sampledColors];
-    const visited = new Uint8Array(canvas.width * canvas.height);
-    const queue   = [];
-    for (let x=0;x<canvas.width;x++) { queue.push([x,0]); queue.push([x,canvas.height-1]); }
-    for (let y=0;y<canvas.height;y++) { queue.push([0,y]); queue.push([canvas.width-1,y]);  }
-    samples.forEach(({x,y}) => queue.push([x,y]));
-    const isBg = (r,g,b) => allBg.some(([br,bg,bb]) => Math.abs(r-br)+Math.abs(g-bg)+Math.abs(b-bb)<tol);
-    let qi=0;
-    while (qi < queue.length) {
-      const [x,y] = queue[qi++];
-      if (x<0||x>=canvas.width||y<0||y>=canvas.height) continue;
-      const idx = y*canvas.width+x;
-      if (visited[idx]) continue;
-      visited[idx]=1;
-      const pi=idx*4;
-      if (!isBg(d[pi],d[pi+1],d[pi+2])) continue;
-      d[pi+3]=0;
-      queue.push([x+1,y],[x-1,y],[x,y+1],[x,y-1]);
-    }
-    // Suavizado de bordes
-    for (let y=1;y<canvas.height-1;y++) for (let x=1;x<canvas.width-1;x++) {
-      const idx=(y*canvas.width+x)*4;
-      if (d[idx+3]>0) {
-        const nb=[((y-1)*canvas.width+x)*4,((y+1)*canvas.width+x)*4,(y*canvas.width+(x-1))*4,(y*canvas.width+(x+1))*4];
-        const t=nb.filter(n=>d[n+3]===0).length;
-        if (t>0) d[idx+3]=Math.max(0,255-t*55);
-      }
-    }
-    ctx.putImageData(imgData,0,0);
-    resolve();
-  });
-
-  const fallbackRemove = (canvas) => {
-    const ctx=canvas.getContext("2d"), data=ctx.getImageData(0,0,canvas.width,canvas.height);
-    const d=data.data, tol=tolerance*3, cr=d[0], cg=d[1], cb=d[2];
-    for (let i=0;i<d.length;i+=4)
-      if (Math.abs(d[i]-cr)+Math.abs(d[i+1]-cg)+Math.abs(d[i+2]-cb)<tol) d[i+3]=0;
-    ctx.putImageData(data,0,0);
-    setBgPreview(canvas.toDataURL());
-    const ni=new Image(); ni.onload=()=>{cleanImgRef.current=ni;setImgEl(ni);}; ni.src=canvas.toDataURL();
-    saveSnap(canvas);
-    setBgStatus("done"); setBgMessage("✓ Modo rápido aplicado");
   };
 
   const restoreBg = () => {
@@ -597,7 +319,7 @@ tolerance: 10-60 según nitidez de bordes.` }
     canvas.width=w; canvas.height=h;
     canvas.getContext("2d").drawImage(tmp,0,0);
     const ni=new Image();
-    ni.onload=()=>{ cleanImgRef.current=ni; setImgEl(ni); setCanvasDims({w,h}); fitToView(w,h); setActiveFilter("none"); setAdj({...ADJ_DEFAULTS}); saveSnap(canvas); };
+    ni.onload=()=>{ cleanImgRef.current=ni; setImgEl(ni); setCanvasDims({w,h}); fitToView(w,h); setActiveFilter("none"); resetAdj(); saveSnap(canvas); };
     ni.src=canvas.toDataURL();
     setCropStart(null); setCropEnd(null); setActiveTool("select");
   };
@@ -614,7 +336,7 @@ tolerance: 10-60 según nitidez de bordes.` }
     tc.translate(tmp.width/2,tmp.height/2); tc.rotate(deg*Math.PI/180); tc.drawImage(canvas,-canvas.width/2,-canvas.height/2);
     canvas.width=tmp.width; canvas.height=tmp.height; canvas.getContext("2d").drawImage(tmp,0,0);
     const ni=new Image();
-    ni.onload=()=>{ cleanImgRef.current=ni; setImgEl(ni); setCanvasDims({w:canvas.width,h:canvas.height}); fitToView(canvas.width,canvas.height); setActiveFilter("none"); setAdj({...ADJ_DEFAULTS}); saveSnap(canvas); };
+    ni.onload=()=>{ cleanImgRef.current=ni; setImgEl(ni); setCanvasDims({w:canvas.width,h:canvas.height}); fitToView(canvas.width,canvas.height); setActiveFilter("none"); resetAdj(); saveSnap(canvas); };
     ni.src=canvas.toDataURL();
   };
 
@@ -630,7 +352,7 @@ tolerance: 10-60 según nitidez de bordes.` }
     tc.scale(dir==="h"?-1:1, dir==="v"?-1:1); tc.drawImage(canvas,0,0);
     ctx.clearRect(0,0,canvas.width,canvas.height); ctx.drawImage(tmp,0,0);
     const ni=new Image();
-    ni.onload=()=>{ cleanImgRef.current=ni; setImgEl(ni); setActiveFilter("none"); setAdj({...ADJ_DEFAULTS}); saveSnap(canvas); };
+    ni.onload=()=>{ cleanImgRef.current=ni; setImgEl(ni); setActiveFilter("none"); resetAdj(); saveSnap(canvas); };
     ni.src=canvas.toDataURL();
   };
 
@@ -644,7 +366,7 @@ tolerance: 10-60 según nitidez de bordes.` }
     tmp.getContext("2d").drawImage(canvas,0,0,outW,outH);
     canvas.width=outW; canvas.height=outH; canvas.getContext("2d").drawImage(tmp,0,0);
     const ni=new Image();
-    ni.onload=()=>{ cleanImgRef.current=ni; setImgEl(ni); setCanvasDims({w:outW,h:outH}); fitToView(outW,outH); setActiveFilter("none"); setAdj({...ADJ_DEFAULTS}); saveSnap(canvas); };
+    ni.onload=()=>{ cleanImgRef.current=ni; setImgEl(ni); setCanvasDims({w:outW,h:outH}); fitToView(outW,outH); setActiveFilter("none"); resetAdj(); saveSnap(canvas); };
     ni.src=canvas.toDataURL();
   };
 
@@ -739,6 +461,7 @@ tolerance: 10-60 según nitidez de bordes.` }
           onDragOver={e=>e.preventDefault()}
           onDrop={e=>{e.preventDefault();if(e.dataTransfer.files[0])loadImage(e.dataTransfer.files[0]);}}>
           <div style={S.checker}/>
+          {/* Drop zone — visible solo sin imagen */}
           {!hasImage && (
             <div style={S.dropZone}>
               <div style={{fontSize:52,opacity:.2}}>🖼</div>
@@ -747,25 +470,25 @@ tolerance: 10-60 según nitidez de bordes.` }
               <button style={{...S.btnPrimary,marginTop:16}} onClick={()=>fileInputRef.current.click()}>+ cargar imagen</button>
             </div>
           )}
-          {hasImage && (
-            <div style={{position:"relative"}}>
-              <canvas ref={canvasRef}
-                style={{display:"block",width:canvasDims.w*zoomLevel,height:canvasDims.h*zoomLevel,
-                  cursor:TOOLS.find(t=>t.id===activeTool)?.cursor||"default"}}
-                onMouseDown={onMD} onMouseMove={onMM} onMouseUp={onMU}/>
-              {cropRect && (
-                <div style={{position:"absolute",border:"2px solid #00d4aa",background:"rgba(0,212,170,.05)",
-                  pointerEvents:"none",left:cropRect.x,top:cropRect.y,width:cropRect.w,height:cropRect.h}}>
-                  {[33.3,66.6].map(p=>(
-                    <div key={p} style={{position:"absolute",left:`${p}%`,top:0,bottom:0,borderLeft:"1px solid rgba(255,255,255,.25)"}}/>
-                  ))}
-                  {[33.3,66.6].map(p=>(
-                    <div key={p} style={{position:"absolute",top:`${p}%`,left:0,right:0,borderTop:"1px solid rgba(255,255,255,.25)"}}/>
-                  ))}
-                </div>
-              )}
-            </div>
-          )}
+
+          {/* Canvas — SIEMPRE en el DOM, solo oculto visualmente sin imagen */}
+          <div style={{position:"relative", display: hasImage ? "block" : "none"}}>
+            <canvas ref={canvasRef}
+              style={{display:"block", width:canvasDims.w*zoomLevel, height:canvasDims.h*zoomLevel,
+                cursor:TOOLS.find(t=>t.id===activeTool)?.cursor||"default"}}
+              onMouseDown={onMD} onMouseMove={onMM} onMouseUp={onMU}/>
+            {cropRect && (
+              <div style={{position:"absolute",border:"2px solid #00d4aa",background:"rgba(0,212,170,.05)",
+                pointerEvents:"none",left:cropRect.x,top:cropRect.y,width:cropRect.w,height:cropRect.h}}>
+                {[33.3,66.6].map(p=>(
+                  <div key={p} style={{position:"absolute",left:`${p}%`,top:0,bottom:0,borderLeft:"1px solid rgba(255,255,255,.25)"}}/>
+                ))}
+                {[33.3,66.6].map(p=>(
+                  <div key={p} style={{position:"absolute",top:`${p}%`,left:0,right:0,borderTop:"1px solid rgba(255,255,255,.25)"}}/>
+                ))}
+              </div>
+            )}
+          </div>
         </div>
 
         {/* PANEL DERECHO */}
@@ -806,23 +529,23 @@ tolerance: 10-60 según nitidez de bordes.` }
                 {bgStatus==="done"    && <div style={{fontSize:10,color:"#16a34a",marginBottom:6}}>✓ {bgMessage}</div>}
                 {bgStatus==="error"   && <div style={{fontSize:10,color:"#dc2626",marginBottom:6}}>⚠ {bgMessage}</div>}
                 <button style={{...S.applyBtn,background:"#7c3aed",marginBottom:4}}
-                  onClick={removeBackgroundAI} disabled={!hasImage||bgStatus==="loading"}>
+                  onClick={handleRemoveBG} disabled={!hasImage||bgStatus==="loading"}>
                   {bgStatus==="loading"?"⟳ procesando...":"🪄 quitar fondo con IA"}
                 </button>
                 <button style={{...S.applyBtn,...S.applyBtnGhost}} onClick={restoreBg}>↩ restaurar original</button>
               </div>
 
-              <SectionHeader label="Luz" onReset={()=>setAdj(a=>({...a,exposure:0,contrast:0,brightness:0,shadows:0,highlights:0}))}/>
+              <SectionHeader label="Luz" onReset={()=>resetAdjGroup('light')}/>
               {[["Exposición","exposure"],["Contraste","contrast"],["Brillo","brightness"],["Sombras","shadows"],["Altas luces","highlights"]].map(([l,k])=>(
                 <SliderRow key={k} label={l} id={k} value={adj[k]} onChange={(id,v)=>setAdj(a=>({...a,[id]:v}))}/>
               ))}
 
-              <SectionHeader label="Color" onReset={()=>setAdj(a=>({...a,saturation:0,temperature:0,tint:0,vibrance:0}))}/>
+              <SectionHeader label="Color" onReset={()=>resetAdjGroup('color')}/>
               {[["Saturación","saturation"],["Temperatura","temperature"],["Tinte","tint"],["Vibración","vibrance"]].map(([l,k])=>(
                 <SliderRow key={k} label={l} id={k} value={adj[k]} onChange={(id,v)=>setAdj(a=>({...a,[id]:v}))}/>
               ))}
 
-              <SectionHeader label="Detalle" onReset={()=>setAdj(a=>({...a,sharpness:0,clarity:0,noise:0,vignette:0}))}/>
+              <SectionHeader label="Detalle" onReset={()=>resetAdjGroup('detail')}/>
               <SliderRow label="Nitidez"  id="sharpness" min={0} max={100} value={adj.sharpness} onChange={(id,v)=>setAdj(a=>({...a,[id]:v}))}/>
               <SliderRow label="Claridad" id="clarity"              value={adj.clarity}   onChange={(id,v)=>setAdj(a=>({...a,[id]:v}))}/>
               <SliderRow label="Ruido"    id="noise"    min={0} max={100} value={adj.noise}     onChange={(id,v)=>setAdj(a=>({...a,[id]:v}))}/>
@@ -830,7 +553,7 @@ tolerance: 10-60 según nitidez de bordes.` }
 
               <button style={{...S.applyBtn,marginTop:10}} onClick={commitToBase}>✓ aplicar y congelar</button>
               <button style={{...S.applyBtn,...S.applyBtnGhost,marginTop:4}}
-                onClick={()=>{setAdj({...ADJ_DEFAULTS});setActiveFilter("none");}}>
+                onClick={()=>{resetAdj();setActiveFilter("none");}}>
                 ↺ resetear ajustes
               </button>
             </>}
@@ -883,6 +606,16 @@ tolerance: 10-60 según nitidez de bordes.` }
               <button style={{...S.applyBtn,marginTop:10}} onClick={commitToBase}>✓ aplicar filtro</button>
             </>}
 
+            {/* EFECTOS */}
+            {activeTab==="effects" && (
+              <EffectsPanel
+                canvasRef={canvasRef}
+                cleanImgRef={cleanImgRef}
+                hasImage={hasImage}
+                onCommit={(canvas) => saveSnap(canvas)}
+              />
+            )}
+
             {/* EXPORT */}
             {activeTab==="export" && <>
               <SectionHeader label="Formato de salida"/>
@@ -901,7 +634,7 @@ tolerance: 10-60 según nitidez de bordes.` }
               <div style={S.sizeCard}>
                 <span style={{color:"#888"}}>Tamaño estimado</span>
                 <span style={{color:"#16a34a",fontWeight:500}}>
-                  {hasImage?estimateSize(canvasDims.w,canvasDims.h,outputFormat,quality):"—"}
+                  {hasImage?estimateFileSize(canvasDims.w,canvasDims.h,outputFormat,quality):"—"}
                 </span>
               </div>
               <div style={{...S.sizeCard,marginTop:4}}>
@@ -926,13 +659,24 @@ tolerance: 10-60 según nitidez de bordes.` }
       <div style={S.statusbar}>
         <StatItem label="herramienta" value={activeTool}/>
         <StatItem label="dimensión"   value={canvasDims.w>0?`${canvasDims.w}×${canvasDims.h}`:"—"}/>
-        <StatItem label="zoom"        value={`${Math.round(zoomLevel*100)}%`}/>
         <StatItem label="filtro"      value={activeFilter}/>
         <StatItem label="historial"   value={`${histPos+1}/${historyLen}`}/>
         <div style={{marginLeft:"auto",display:"flex",gap:4,alignItems:"center"}}>
-          <button style={S.zoomBtn} onClick={()=>setZoomLevel(z=>Math.max(0.05,z-0.25))}>−</button>
-          <span style={{fontSize:10,color:"#aaa",minWidth:36,textAlign:"center"}}>{Math.round(zoomLevel*100)}%</span>
-          <button style={S.zoomBtn} onClick={()=>setZoomLevel(z=>Math.min(8,z+0.25))}>+</button>
+          <button style={S.zoomBtn} onClick={()=>setZoomLevel(z=>Math.max(0.1,+(z-0.1).toFixed(2)))}>−</button>
+          <input
+            type="number" min={10} max={250} step={5}
+            value={Math.round(zoomLevel*100)}
+            onChange={e=>{
+              const v = Math.min(250, Math.max(10, parseInt(e.target.value)||10));
+              setZoomLevel(v/100);
+            }}
+            style={{ width:52, textAlign:"center", fontSize:11,
+                     background:"#f5f5f3", border:"1px solid #e0ddd5",
+                     borderRadius:3, padding:"2px 4px", fontFamily:"inherit",
+                     color:"#333" }}
+          />
+          <span style={{fontSize:10,color:"#aaa"}}>%</span>
+          <button style={S.zoomBtn} onClick={()=>setZoomLevel(z=>Math.min(2.5,+(z+0.1).toFixed(2)))}>+</button>
           <button style={{...S.zoomBtn,width:"auto",padding:"0 8px",fontSize:9}}
             onClick={()=>fitToView(canvasDims.w,canvasDims.h)}>fit</button>
         </div>
@@ -941,37 +685,14 @@ tolerance: 10-60 según nitidez de bordes.` }
   );
 }
 
-// ─── Estilos ──────────────────────────────────────────────────────────────────
+// ─── Estilos — desde designSystem ────────────────────────────────────────────
 
-const S = {
-  root:         { display:"flex",flexDirection:"column",height:"100vh",background:"#f0efea",
-                  color:"#222",fontFamily:"'SF Mono','Fira Code',monospace",fontSize:12,overflow:"hidden" },
-  topbar:       { height:46,background:"#fff",borderBottom:"1px solid #e0ddd5",display:"flex",
-                  alignItems:"center",gap:4,padding:"0 8px",flexShrink:0,boxShadow:"0 1px 0 rgba(0,0,0,.04)" },
-  logo:         { fontSize:13,fontWeight:700,letterSpacing:2,color:"#111",padding:"0 14px",borderRight:"1px solid #e0ddd5" },
-  tbGroup:      { display:"flex",alignItems:"center",gap:2,padding:"0 8px",borderRight:"1px solid #e0ddd5" },
-  btnPrimary:   { background:"#111",color:"#fff",border:"none",borderRadius:4,padding:"5px 12px",cursor:"pointer",fontSize:11,fontFamily:"inherit" },
-  btnAccent:    { background:"#00d4aa",marginLeft:4 },
-  main:         { display:"flex",flex:1,overflow:"hidden" },
-  toolsPanel:   { width:46,background:"#fff",borderRight:"1px solid #e0ddd5",display:"flex",flexDirection:"column",alignItems:"center",padding:"8px 0",gap:2,flexShrink:0 },
-  toolBtn:      { width:34,height:34,border:"none",background:"none",color:"#aaa",borderRadius:5,cursor:"pointer",fontSize:16,transition:"all .15s" },
-  toolActive:   { background:"#111",color:"#fff" },
-  canvasWrap:   { flex:1,background:"#e8e6e0",display:"flex",alignItems:"center",justifyContent:"center",position:"relative",overflow:"auto" },
-  checker:      { position:"absolute",inset:0,backgroundImage:"linear-gradient(45deg,#ddd 25%,transparent 25%),linear-gradient(-45deg,#ddd 25%,transparent 25%),linear-gradient(45deg,transparent 75%,#ddd 75%),linear-gradient(-45deg,transparent 75%,#ddd 75%)",backgroundSize:"14px 14px",backgroundPosition:"0 0,0 7px,7px -7px,-7px 0",pointerEvents:"none" },
-  dropZone:     { position:"absolute",inset:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:8 },
-  rightPanel:   { width:222,background:"#fff",borderLeft:"1px solid #e0ddd5",display:"flex",flexDirection:"column",flexShrink:0,overflow:"hidden" },
-  panelTabs:    { display:"flex",borderBottom:"1px solid #e0ddd5",flexShrink:0 },
-  ptab:         { flex:1,background:"none",border:"none",color:"#bbb",padding:"8px 2px",cursor:"pointer",fontSize:9,letterSpacing:.5,textTransform:"uppercase",borderBottom:"2px solid transparent",transition:"all .15s" },
-  ptabActive:   { color:"#00d4aa",borderBottomColor:"#00d4aa" },
-  aiBanner:     { background:"#faf5ff",border:"1px solid #e9d5ff",borderRadius:6,padding:10,marginBottom:4 },
-  aiBadge:      { fontSize:8,background:"#f3e8ff",color:"#7c3aed",border:"1px solid #d8b4fe",padding:"2px 6px",borderRadius:3 },
-  applyBtn:     { width:"100%",background:"#111",color:"#fff",border:"none",borderRadius:4,padding:7,cursor:"pointer",fontSize:11,fontFamily:"inherit" },
-  applyBtnGhost:{ background:"#f5f5f3",color:"#888",border:"1px solid #e0ddd5" },
-  fmtBtn:       { background:"#f5f5f3",border:"1px solid #e0ddd5",color:"#555",borderRadius:4,padding:"6px 4px",cursor:"pointer",fontSize:10,textAlign:"center" },
-  outBtn:       { flex:1,background:"#f5f5f3",border:"1px solid #e0ddd5",color:"#888",borderRadius:3,padding:5,cursor:"pointer",fontSize:10,textAlign:"center" },
-  outBtnActive: { background:"#111",borderColor:"#111",color:"#fff" },
-  sizeCard:     { fontSize:10,color:"#888",background:"#f5f5f3",padding:"6px 8px",borderRadius:3,display:"flex",justifyContent:"space-between",alignItems:"center" },
-  numInput:     { width:"100%",background:"#f5f5f3",border:"1px solid #e0ddd5",color:"#222",borderRadius:3,padding:"4px 6px",fontSize:10,fontFamily:"inherit" },
-  statusbar:    { height:36,background:"#fff",borderTop:"1px solid #e0ddd5",display:"flex",alignItems:"center",padding:"0 14px",gap:16,flexShrink:0 },
-  zoomBtn:      { background:"none",border:"1px solid #e0ddd5",color:"#aaa",width:22,height:22,borderRadius:3,cursor:"pointer",fontSize:12,lineHeight:1,fontFamily:"inherit" },
-};
+// ─── Export default con Error Boundary (Capa 5) ───────────────────────────────
+
+export default function ToolEditor(props) {
+  return (
+    <ToolEditorErrorBoundary onError={props.onError}>
+      <ToolEditorInner {...props} />
+    </ToolEditorErrorBoundary>
+  );
+}

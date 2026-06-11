@@ -483,3 +483,237 @@ function xorWithKey(bytes, key) {
   }
   return result;
 }
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// MOVIDO DESDE ToolEditor.jsx — Capa 1: Funcionalidad
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/**
+ * Aplica todos los ajustes de imagen en píxeles.
+ * Exposición, contraste, brillo, sombras, altas luces,
+ * temperatura, tinte, saturación, nitidez, claridad, ruido, viñeta.
+ */
+export function applyPixelAdjustments(imageData, adj) {
+  const d   = imageData.data;
+  const W   = imageData.width;
+  const H   = imageData.height;
+  const exp = adj.exposure    / 100;
+  const con = (adj.contrast   + 100) / 100;
+  const bri = adj.brightness  / 100;
+  const sha = adj.shadows     / 100;
+  const hig = adj.highlights  / 100;
+  const sat = (adj.saturation + 100) / 100;
+  const tmp = adj.temperature / 100;
+  const tnt = adj.tint        / 100;
+  const vig = adj.vignette    / 100;
+  const noi = adj.noise       / 100;
+  const cxv = W / 2, cyv = H / 2;
+  const maxD = Math.sqrt(cxv*cxv + cyv*cyv);
+
+  let src = null;
+  if (adj.sharpness > 0 || adj.clarity !== 0) src = new Uint8ClampedArray(d);
+
+  for (let i = 0; i < d.length; i += 4) {
+    let r = d[i], g = d[i+1], b = d[i+2];
+    // Exposure
+    r = Math.min(255, r*(1+exp)); g = Math.min(255, g*(1+exp)); b = Math.min(255, b*(1+exp));
+    // Contrast
+    r = Math.min(255,Math.max(0,((r/255-0.5)*con+0.5)*255));
+    g = Math.min(255,Math.max(0,((g/255-0.5)*con+0.5)*255));
+    b = Math.min(255,Math.max(0,((b/255-0.5)*con+0.5)*255));
+    // Brightness
+    r = Math.min(255,Math.max(0,r+bri*255));
+    g = Math.min(255,Math.max(0,g+bri*255));
+    b = Math.min(255,Math.max(0,b+bri*255));
+    // Shadows / Highlights
+    const lum = (r*0.299+g*0.587+b*0.114)/255;
+    const sBoost = sha*Math.max(0,1-lum*2)*80;
+    const hBoost = hig*Math.max(0,lum*2-1)*80;
+    r = Math.min(255,Math.max(0,r+sBoost+hBoost));
+    g = Math.min(255,Math.max(0,g+sBoost+hBoost));
+    b = Math.min(255,Math.max(0,b+sBoost+hBoost));
+    // Temperature / Tint
+    r = Math.min(255,Math.max(0,r+tmp*35)); b = Math.min(255,Math.max(0,b-tmp*35));
+    g = Math.min(255,Math.max(0,g+tnt*20));
+    // Saturation
+    const gray = r*0.299+g*0.587+b*0.114;
+    r = Math.min(255,Math.max(0,gray+(r-gray)*sat));
+    g = Math.min(255,Math.max(0,gray+(g-gray)*sat));
+    b = Math.min(255,Math.max(0,gray+(b-gray)*sat));
+    // Noise
+    if (noi > 0) {
+      const px=(i/4)%W, py=Math.floor(i/4/W);
+      const grain=(((px*1234+py*5678)%256)/256-0.5)*noi*60;
+      r=Math.min(255,Math.max(0,r+grain));
+      g=Math.min(255,Math.max(0,g+grain));
+      b=Math.min(255,Math.max(0,b+grain));
+    }
+    // Vignette
+    if (vig !== 0) {
+      const px=(i/4)%W, py=Math.floor(i/4/W);
+      const dist=Math.sqrt((px-cxv)**2+(py-cyv)**2)/maxD;
+      const v=vig>0?1-dist*vig:1+dist*(-vig)*0.5;
+      r=Math.min(255,Math.max(0,r*v)); g=Math.min(255,Math.max(0,g*v)); b=Math.min(255,Math.max(0,b*v));
+    }
+    d[i]=r; d[i+1]=g; d[i+2]=b;
+  }
+  // Sharpness — unsharp mask 3x3
+  if (src && adj.sharpness > 0) {
+    const str = adj.sharpness/100;
+    for (let y=1;y<H-1;y++) for (let x=1;x<W-1;x++) {
+      const c=(y*W+x)*4;
+      for (let ch=0;ch<3;ch++) {
+        const blur=(src[(y-1)*W*4+x*4+ch]+src[(y+1)*W*4+x*4+ch]+src[y*W*4+(x-1)*4+ch]+src[y*W*4+(x+1)*4+ch])/4;
+        d[c+ch]=Math.min(255,Math.max(0,d[c+ch]+(d[c+ch]-blur)*str*2));
+      }
+    }
+  }
+  // Clarity — micro-contraste local
+  if (src && adj.clarity !== 0) {
+    const str = adj.clarity/100;
+    for (let y=2;y<H-2;y++) for (let x=2;x<W-2;x++) {
+      const c=(y*W+x)*4;
+      for (let ch=0;ch<3;ch++) {
+        const local=(src[(y-2)*W*4+x*4+ch]+src[(y+2)*W*4+x*4+ch]+src[y*W*4+(x-2)*4+ch]+src[y*W*4+(x+2)*4+ch])/4;
+        d[c+ch]=Math.min(255,Math.max(0,d[c+ch]+(d[c+ch]-local)*str*1.5));
+      }
+    }
+  }
+  return imageData;
+}
+
+/**
+ * Hornea un filtro CSS en los píxeles reales del canvas.
+ * Necesario para que el filtro aparezca en la exportación.
+ */
+export function bakeFilterToPixels(canvas, filterCSS) {
+  if (!filterCSS || filterCSS === "none") return;
+  const tmp = document.createElement("canvas");
+  tmp.width = canvas.width; tmp.height = canvas.height;
+  const tc = tmp.getContext("2d");
+  tc.filter = filterCSS;
+  tc.drawImage(canvas, 0, 0);
+  canvas.getContext("2d").clearRect(0, 0, canvas.width, canvas.height);
+  canvas.getContext("2d").drawImage(tmp, 0, 0);
+}
+
+/**
+ * Estima el tamaño del archivo de salida según dimensiones, formato y calidad.
+ */
+export function estimateFileSize(w, h, format, quality) {
+  const bpp  = format === "png" ? 4 : format === "webp" ? 1.5 : 1;
+  const base = w * h * bpp * (format === "jpeg" ? quality/100 : 1);
+  const kb   = Math.round(base / 1024);
+  return kb > 1024 ? `~${(kb/1024).toFixed(1)} MB` : `~${kb} KB`;
+}
+
+/**
+ * Remove background con IA — llama a Claude Vision, analiza el fondo
+ * y aplica flood-fill BFS con suavizado de bordes.
+ * @param {HTMLCanvasElement} canvas
+ * @param {number} tolerance  5-80
+ * @param {function} onStatus  callback(mensaje) para actualizar UI
+ * @returns {{ subject: string }}
+ */
+export async function removeBackgroundAI(canvas, tolerance, onStatus = () => {}) {
+  onStatus("Enviando a Claude Vision...");
+  const base64 = canvas.toDataURL("image/jpeg", 0.8).split(",")[1];
+  onStatus("Analizando sujeto principal...");
+
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 1000,
+      messages: [{
+        role: "user",
+        content: [
+          { type:"image", source:{ type:"base64", media_type:"image/jpeg", data:base64 } },
+          { type:"text",  text:`Analiza esta imagen. Devuelve SOLO JSON sin markdown:
+{
+  "subject": "descripción breve del sujeto",
+  "bg_colors": [[R,G,B],[R,G,B],[R,G,B]],
+  "sample_points": [[x_pct,y_pct],...],
+  "tolerance": 25
+}
+bg_colors: colores del FONDO (no del sujeto), RGB 0-255.
+sample_points: coordenadas 0.0-1.0 de píxeles que son FONDO seguro.
+tolerance: 10-60 según nitidez de bordes.` }
+        ]
+      }]
+    })
+  });
+
+  const data = await response.json();
+  const text = data.content?.find(b => b.type === "text")?.text || "";
+  const analysis = JSON.parse(text.replace(/```json|```/g, "").trim());
+
+  onStatus(`Sujeto: ${analysis.subject} — removiendo fondo...`);
+  await smartFloodFill(canvas, analysis, tolerance);
+  return { subject: analysis.subject };
+}
+
+/**
+ * Flood-fill BFS inteligente usando colores detectados por IA.
+ * Aplica suavizado de bordes al final.
+ */
+export function smartFloodFill(canvas, analysis, toleranceFallback = 30) {
+  return new Promise(resolve => {
+    const ctx     = canvas.getContext("2d");
+    const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const d       = imgData.data;
+    const tol     = (analysis.tolerance || toleranceFallback) * 3;
+    const bgColors= analysis.bg_colors || [[255,255,255]];
+    const samples = (analysis.sample_points || [[0,0],[1,0],[0,1],[1,1]])
+      .map(([xp,yp]) => ({ x:Math.round(xp*canvas.width), y:Math.round(yp*canvas.height) }));
+    const sampledColors = samples.map(({x,y}) => {
+      const i=(y*canvas.width+x)*4; return [d[i],d[i+1],d[i+2]];
+    });
+    const allBg   = [...bgColors, ...sampledColors];
+    const visited = new Uint8Array(canvas.width * canvas.height);
+    const queue   = [];
+    for (let x=0;x<canvas.width;x++)  { queue.push([x,0]); queue.push([x,canvas.height-1]); }
+    for (let y=0;y<canvas.height;y++) { queue.push([0,y]); queue.push([canvas.width-1,y]);  }
+    samples.forEach(({x,y}) => queue.push([x,y]));
+    const isBg = (r,g,b) => allBg.some(([br,bg,bb]) => Math.abs(r-br)+Math.abs(g-bg)+Math.abs(b-bb)<tol);
+    let qi=0;
+    while (qi < queue.length) {
+      const [x,y]=queue[qi++];
+      if (x<0||x>=canvas.width||y<0||y>=canvas.height) continue;
+      const idx=y*canvas.width+x;
+      if (visited[idx]) continue;
+      visited[idx]=1;
+      const pi=idx*4;
+      if (!isBg(d[pi],d[pi+1],d[pi+2])) continue;
+      d[pi+3]=0;
+      queue.push([x+1,y],[x-1,y],[x,y+1],[x,y-1]);
+    }
+    // Suavizado de bordes
+    for (let y=1;y<canvas.height-1;y++) for (let x=1;x<canvas.width-1;x++) {
+      const idx=(y*canvas.width+x)*4;
+      if (d[idx+3]>0) {
+        const nb=[((y-1)*canvas.width+x)*4,((y+1)*canvas.width+x)*4,(y*canvas.width+(x-1))*4,(y*canvas.width+(x+1))*4];
+        const t=nb.filter(n=>d[n+3]===0).length;
+        if (t>0) d[idx+3]=Math.max(0,255-t*55);
+      }
+    }
+    ctx.putImageData(imgData,0,0);
+    resolve();
+  });
+}
+
+/**
+ * Remove background modo rápido — flood fill por color de esquina.
+ * Fallback cuando la IA no está disponible.
+ */
+export function removeBackgroundFallback(canvas, tolerance = 30) {
+  const ctx  = canvas.getContext("2d");
+  const data = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const d    = data.data;
+  const tol  = tolerance * 3;
+  const cr=d[0], cg=d[1], cb=d[2];
+  for (let i=0;i<d.length;i+=4)
+    if (Math.abs(d[i]-cr)+Math.abs(d[i+1]-cg)+Math.abs(d[i+2]-cb)<tol) d[i+3]=0;
+  ctx.putImageData(data,0,0);
+}
